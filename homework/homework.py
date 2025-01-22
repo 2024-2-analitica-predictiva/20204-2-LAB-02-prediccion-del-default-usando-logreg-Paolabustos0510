@@ -48,10 +48,64 @@
 # Renombre la columna "default payment next month" a "default"
 # y remueva la columna "ID".
 #
-#
+import pandas as pd
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV
+import pickle
+from sklearn.metrics import precision_score
+from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import recall_score
+from sklearn.metrics import f1_score
+import json
+from sklearn.metrics import confusion_matrix
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import SelectKBest
+import gzip
+import os
+from sklearn.feature_selection import SelectKBest, f_classif
+
+#agrupar educaciones mayores que 4 (Others)
+def agrupar_educaciones(codigo_educacion):
+    if codigo_educacion > 4:
+        return 4
+    return codigo_educacion
+
+
+def cargar_limpiar_dataset(nombre_archivo):
+    datos = pd.read_csv(nombre_archivo)
+    
+    # - Renombre la columna "default payment next month" a "default".
+    datos = datos.rename(columns={"default payment next month" : "default"})
+
+    # Remueva la columna "ID".
+    datos.drop(columns=["ID"], inplace = True)
+
+    # Elimine los registros con informacion no disponible.
+    #datos = datos.dropna()
+    datos = datos[(datos["EDUCATION"]!=0) & (datos['MARRIAGE']!=0)]
+
+    # Para la columna EDUCATION, valores > 4 indican niveles superiores de educación, agrupe estos valores en la categoría "others"
+    datos["EDUCATION"] = datos["EDUCATION"].apply(agrupar_educaciones)
+
+    return datos
+
+datos_entrenamiento = cargar_limpiar_dataset("files/input/train_default_of_credit_card_clients.csv")
+datos_prueba = cargar_limpiar_dataset("files/input/test_default_of_credit_card_clients.csv")
+
+
+
 # Paso 2.
 # Divida los datasets en x_train, y_train, x_test, y_test.
-#
+
+x_train = datos_entrenamiento.drop(columns=["default"])
+y_train = datos_entrenamiento["default"]
+
+x_test = datos_prueba.drop(columns=["default"])
+y_test = datos_prueba["default"]
+
 #
 # Paso 3.
 # Cree un pipeline para el modelo de clasificación. Este pipeline debe
@@ -62,17 +116,76 @@
 # - Selecciona las K mejores caracteristicas.
 # - Ajusta un modelo de regresion logistica.
 #
-#
+# Transformación variables categóricas usando el método one-hot-encoding.
+variables_categoricas = ["SEX", "EDUCATION", "MARRIAGE"]
+variables_numericas = [col for col in x_train.columns if col not in variables_categoricas]
+
+transformer_variables_categoricas = OneHotEncoder()
+transformer_variables_numericas = MinMaxScaler()
+
+preprocesador = ColumnTransformer(
+    transformers=[
+        ("categoricas", transformer_variables_categoricas, variables_categoricas),
+        ("numericas", transformer_variables_numericas, variables_numericas)
+    ],
+)
+
+# Elección Mejores K
+mejores_k = SelectKBest(score_func=f_classif)
+
+
+ #Crear modelo de Regresión Logística ().
+modelo = LogisticRegression(random_state=23)
+
+# Pipeline completo
+pipeline = Pipeline(
+    steps=[
+        ("preprocesador", preprocesador), 
+        ("mejoresK", mejores_k),
+        ("LGR", modelo),     
+    ]
+)
+
 # Paso 4.
 # Optimice los hiperparametros del pipeline usando validación cruzada.
 # Use 10 splits para la validación cruzada. Use la función de precision
 # balanceada para medir la precisión del modelo.
 #
-#
+# Establecer hiperparámetros a evaluar
+param_grid = [
+    {
+        "mejoresK__k"                 : range(1, len (x_train.columns) + 1),
+        'LGR__C'                      : [0.0001, 0.001, 0.01, 0.1, 1.0],
+        'LGR__solver'                 : ["saga"],
+        'LGR__penalty'                : ["l1", "l2"],
+    }
+]
+
+# Creación malla de hiperpárametros
+busqueda_malla = GridSearchCV(
+    estimator=pipeline, 
+    param_grid=param_grid,
+    scoring="balanced_accuracy",
+    cv=10,
+    verbose=3,
+    #n_jobs=-1,
+)
+
+# Entrenamiento de modelo
+busqueda_malla.fit(x_train, y_train)
+
+
 # Paso 5.
 # Guarde el modelo (comprimido con gzip) como "files/models/model.pkl.gz".
 # Recuerde que es posible guardar el modelo comprimido usanzo la libreria gzip.
-#
+
+mejor_modelo = busqueda_malla.best_estimator_
+mejores_parametros = busqueda_malla.best_params_
+mejor_resultado = busqueda_malla.best_score_
+
+with gzip.open("files/models/model.pkl.gz", "wb") as archivo:
+    pickle.dump(busqueda_malla, archivo)
+
 #
 # Paso 6.
 # Calcule las metricas de precision, precision balanceada, recall,
@@ -85,7 +198,46 @@
 # {'type': 'metrics', 'dataset': 'train', 'precision': 0.8, 'balanced_accuracy': 0.7, 'recall': 0.9, 'f1_score': 0.85}
 # {'type': 'metrics', 'dataset': 'test', 'precision': 0.7, 'balanced_accuracy': 0.6, 'recall': 0.8, 'f1_score': 0.75}
 #
-#
+# Función para calcular métricas
+def calcular_metricas(modelo, x, y, tipo_dataset): 
+    y_pred = modelo.predict(x) 
+    diccionario_metricas = {
+        "type" : "metrics",
+        "dataset" : tipo_dataset,
+        "precision" : float(precision_score(y, y_pred, zero_division=0)),
+        "balanced_accuracy" : float(balanced_accuracy_score(y, y_pred)), 
+        "recall" : float(recall_score(y, y_pred)), 
+        "f1_score" : float(f1_score(y, y_pred)), 
+    }
+
+    return diccionario_metricas
+
+def calcular_matriz_confusion(modelo, x, y, tipo_dataset):
+    matriz_con = confusion_matrix(y, modelo.predict(x))
+    diccionario_matriz = {
+        "type": "cm_matrix",
+        "dataset": tipo_dataset,
+        "true_0": {"predicted_0": int(matriz_con[0, 0]), "predicted_1": int(matriz_con[0, 1])},
+        "true_1": {"predicted_0": int(matriz_con[1, 0]), "predicted_1": int(matriz_con[1, 1])},
+    }
+    return diccionario_matriz
+
+
+# Guardar métricas y matrices de consufión
+valores = [
+    calcular_metricas(mejor_modelo, x_train, y_train, "train"),
+    calcular_metricas(mejor_modelo, x_test, y_test, "test"),
+    calcular_matriz_confusion(mejor_modelo, x_train, y_train,"train"),
+    calcular_matriz_confusion(mejor_modelo, x_test, y_test, "test")
+]
+
+# Guardar archivo JSON
+with open("files/output/metrics.json", "w") as archivo:
+    for v in valores:
+        json.dump(v, archivo)
+        archivo.write("\n")
+
+
 # Paso 7.
 # Calcule las matrices de confusion para los conjuntos de entrenamiento y
 # prueba. Guardelas en el archivo files/output/metrics.json. Cada fila
@@ -95,3 +247,4 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
